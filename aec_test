@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jul 14 11:32:28 2017
+
+@author: xuan
+"""
+
+import tensorflow as tf
+from my_clockworkRNN_cell import ClockworkRNNCell
+from keras import backend as K
+from keras.activations import sigmoid
+from keras.layers import Dense, TimeDistributed,GRU
+from keras.objectives import binary_crossentropy
+from keras.optimizers import RMSprop
+from sklearn.metrics import roc_curve, auc, roc_auc_score, precision_recall_curve, average_precision_score
+from datetime import datetime
+import numpy as np
+from sklearn.utils import shuffle
+import pickle
+import os
+#import caffeine
+import math
+import pickle_utils as pu
+import math
+
+
+record = False
+aec = False
+window_to_consider = 0
+max_norm_gradient = 1
+WEIGHT_DECAY_FACTOR = 0
+save_risk_state = True
+dataset=1
+num_epochs = 1
+file_name="CWRNN_save_private_5"
+prefix="/scratch/xuan/auc_results/"
+f_name=prefix+file_name
+pickle_name = f_name+".pickle"
+p_save = f_name+"_risk_state.pickle"
+with open(f_name,"w") as f:
+    f.write(f_name+"\n")
+logdir = "/scratch/xuan/output/"+file_name
+    
+if(dataset==1):
+    exec(open("preprocess.py").read())
+    batch_size = 32
+else:
+    timeSeriesCon, label, sizes2, icustay_ids = pu.load('dataset/data.pkl.gz')
+    N = timeSeriesCon.shape[0]
+    dim = timeSeriesCon[0].shape[1]
+    batch_size = 64
+exec(open("helper_function.py").read())
+
+
+half=False
+if(half):
+    ratio = 0.2
+    i0 = np.nonzero(label==0)[0]
+    i1 = np.nonzero(label==1)[0]
+    i0_new = np.random.choice(i0, math.floor(i0.size*ratio), replace=False)
+    i1_new = np.random.choice(i1, math.floor(i1.size*ratio), replace=False)
+    i_stay = np.concatenate([i0_new,i1_new],axis=0)
+    timeSeriesCon = timeSeriesCon[i_stay]
+    label = label[i_stay]
+    sizes2 = sizes2[i_stay]
+    N = i0_new.size+i1_new.size
+
+clockwork_periods = [1,2,4,8,16,32]
+group_size=10
+
+graph = tf.Graph()
+use_CWR = False
+two_layers = False
+ar = False
+with graph.as_default():
+    ## Learning rate decay schedule
+    #learning_rate       = 1e-3
+    #learning_rate_decay = 0.975
+    #learning_rate_step  = 1000
+    #learning_rate_min   = 1e-5
+    # Global training step
+    global_step = tf.Variable(0, name='global_step', trainable=False)
+    
+    keep_prob = tf.placeholder(tf.float32)
+    
+    cell = ClockworkRNNCell(clockwork_periods, group_size, variant=0);use_CWR=True
+ 
+    ts = tf.placeholder(dtype=tf.float32, shape=[None, None, timeSeriesCon[0].shape[1]])
+    la = tf.placeholder(dtype=tf.int32, shape=[None])
+    seq_length = tf.placeholder(dtype=tf.int32, shape=[None])
+    
+    states, final_state = tf.nn.dynamic_rnn(cell, ts, sequence_length=seq_length, dtype=tf.float32)
+
+    if(two_layers):
+        final_state = final_state[1]
+    if(use_CWR):
+        final_state = final_state[0]
+    if(ar):
+        ar_history = states[1]
+        states = states[0]
+    #final_state = final_state.h
+    l_d = Dense(1)
+    output = tf.squeeze(l_d(final_state), axis=1)
+    l_test = TimeDistributed(l_d)
+    loss =  tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.cast(la, dtype=tf.float32), logits=output)
+    loss = tf.reduce_mean(loss)
+    if(WEIGHT_DECAY_FACTOR!=0):
+        with tf.variable_scope('weights_norm') as scope:
+            #weights_norm = WEIGHT_DECAY_FACTOR*tf.nn.l2_loss(cell.active_W1)
+            #weights_norm += WEIGHT_DECAY_FACTOR*tf.nn.l2_loss(cell.active_W2)
+            #loss += weights_norm
+            l1_reg = tf.contrib.layers.l1_regularizer(WEIGHT_DECAY_FACTOR)
+            loss += tf.contrib.layers.apply_regularization(l1_reg, [cell.active_W1, cell.active_W2])
+    
+    if(aec):
+        decoder_cell = tf.contrib.rnn.GRUCell(timeSeriesCon[0].shape[1])
+        # we use the current state to predict the next input just like language modelling
+        input_to_reconstruct = tf.slice(ts, [0,1,0], [-1,-1,-1]) # romove the first sample in each sequence
+        states_to_decode = tf.slice(states, [0,0,0], [-1,tf.shape(states)[1]-1,-1]) # remove the last state in each sequence
+        states_to_decode.set_shape(tf.TensorShape([None,None,len(clockwork_periods)*group_size]))
+        decoded_states, decoded_final_state = tf.nn.dynamic_rnn(decoder_cell, states_to_decode, sequence_length=seq_length-1, dtype=tf.float32) # notice the -1 for seq_length
+        decode_loss = tf.losses.mean_squared_error(input_to_reconstruct, decoded_states)
+        alpha = 0.5
+        loss = tf.add(tf.multiply(loss, alpha), tf.multiply(decode_loss, 1-alpha))
+
+    correct_pred = tf.equal(tf.cast(tf.greater(output, 0.5),tf.int32), la)
+    accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
+    
+    risk = sigmoid(l_test(states))
+    
+    learning_rate = 0.001#tf.maximum(learning_rate, learning_rate_min)
+    optimizer_ = tf.train.RMSPropOptimizer(learning_rate=learning_rate)
+    grads_and_vars = optimizer_.compute_gradients(loss)
+    def ClipIfNotNone(grad):
+        if grad is None:
+            return grad
+        return tf.clip_by_value(grad, -max_norm_gradient, max_norm_gradient)
+    if(max_norm_gradient > 0):
+            # Perform gradient clipping by the global norm
+            capped_gvs = [(ClipIfNotNone(grad), var) for grad, var in grads_and_vars]
+            # Apply the gradients after clipping them
+            train_op = optimizer_.apply_gradients(
+                capped_gvs,
+                global_step=global_step
+            )
+    else:
+        train_op = optimizer_.apply_gradients(grads_and_vars, global_step=global_step)
+    init = tf.global_variables_initializer()
+    
+    # Keep track of gradient values and their sparsity
+    grad_summaries = []
+    var_summaries = []
+    for g, v in grads_and_vars:
+        if g is not None:
+            var_summaries.append(tf.summary.histogram("var/{}/hist".format(v.name), v))
+            grad_hist_summary = tf.summary.histogram("gradients/{}/hist".format(v.name), g)
+            sparsity_summary  = tf.summary.scalar("gradients/{}/sparsity".format(v.name), tf.nn.zero_fraction(g))
+            grad_summaries.append(grad_hist_summary)
+            grad_summaries.append(sparsity_summary)
+    gradient_summaries_merged = tf.summary.merge(grad_summaries)
+    
+    # Training summaries
+    training_summaries = [
+        tf.summary.scalar("train/loss", loss),
+        tf.summary.scalar("train/accuracy", accuracy),
+    ]
+
+    # Combine the training summaries with the gradient summaries
+    train_summary_op = tf.summary.merge_all()
+
+
+
+nb_splits = 5
+cv = StratifiedKFold(n_splits=nb_splits)
+
+    
+cv_step = 0
+aucs1 = []
+aucs2 = []
+test_loss_all = []
+test_acc_all = []
+whole_metrics_all = []
+
+risk_all = []
+fin_state_all = []
+
+for (i_train, i_test) in cv.split(np.zeros(N), label):
+    cv_step += 1
+    max_length_train = max(sizes2[i_train])
+    __sizes2 = np.array(sizes2)
+    __sizes2[i_train] = np.minimum(__sizes2[i_train], max_length_train)
+    (X_train, y_train, X_test, y_test, max_length_test) = splitData(i_train, i_test, max_length_train, pad_dir='right')
+    num_train = i_train.size
+    
+    with open(f_name,"a") as f:
+        f.write("cross-validation step {}/{}\n".format(cv_step, nb_splits))
+    
+    with tf.Session(graph=graph) as sess:
+        
+        if(record):
+            # Initialize summary writer
+            summary_out_dir = os.path.join(logdir, "summaries_{}".format(cv_step))
+            summary_out_dir_test = os.path.join(logdir, "test_summaries_{}".format(cv_step))
+            summary_writer  = tf.summary.FileWriter(summary_out_dir)
+            summary_writer_test  = tf.summary.FileWriter(summary_out_dir_test)
+        K.set_session(sess)
+        sess.run(init)
+        
+        # Compute the number of training steps
+        step_in_epoch, steps_per_epoch = 0, int(math.floor(len(X_train)/batch_size))
+        num_steps = steps_per_epoch*num_epochs
+        train_step = 0
+        
+        for cur_step in range(num_steps):
+    
+            ################################################################
+            ########################## TRAINING ############################
+            ################################################################
+    
+            index_start = step_in_epoch*batch_size
+            index_end   = index_start+batch_size
+    
+            # Actual training of the network
+            _, train_step, train_loss, train_accu = sess.run(
+                [train_op,
+                 global_step,
+                 loss,
+                 accuracy],
+                feed_dict={
+                    keep_prob:0.5,
+                    ts:  X_train[index_start:index_end,],
+                    la:  y_train[index_start:index_end],
+                    seq_length: __sizes2[i_train[index_start:index_end]]
+                }
+            )
+            
+            
+            if train_step % (10) == 0:
+                #print("[%s] Step %05i/%05i, LR = %.2e, Loss = %.5f" %
+                #(datetime.now().strftime("%Y-%m-%d %H:%M"), train_step, num_steps, l_rate, train_loss))
+                print("[%s] Step %05i/%05i, Loss = %.5f, accuracy = %.4f" %
+                (datetime.now().strftime("%Y-%m-%d %H:%M"), train_step, num_steps, train_loss, train_accu))
+                if(record):
+                    train_summary = sess.run(train_summary_op,
+                            feed_dict={
+                                keep_prob:1.0,
+                                ts:  X_train[index_start:index_end,],
+                                la:  y_train[index_start:index_end],
+                                seq_length: __sizes2[i_train[index_start:index_end]]
+                            }
+                        )
+                    # Save summaries to disk
+                    summary_writer.add_summary(train_summary, train_step)
+                
+    
+            step_in_epoch += 1
+    
+            ################################################################
+            ############### MODEL TESTING ON EVALUATION DATA ###############
+            ################################################################
+    
+            if step_in_epoch == steps_per_epoch:
+    
+                # End of epoch, check some validation examples
+                print("#" * 100)
+                print("MODEL TESTING ON VALIDATION DATA (%i examples):" % i_test.size)
+    
+                risk_ , test_loss, test_accu,fin_state = sess.run([risk, loss, accuracy,final_state],
+                        feed_dict={
+                            keep_prob:1.0,
+                            ts:  X_test,
+                            la:  y_test,
+                            seq_length: __sizes2[i_test]
+                        }
+                    )
+                test_loss_all.append(test_loss)
+                test_acc_all.append(test_accu)
+
+                at_epoch = cur_step//steps_per_epoch+1
+                print(at_epoch)
+                if(save_risk_state):
+                    if(at_epoch==1):
+                        risk_all.append(risk_)
+                        fin_state_all.append(fin_state)
+                        with open(p_save,'wb') as p:
+                            pickle.dump([risk_all, fin_state_all], p)
+                    
+                
+                if(record):
+                    test_summary = sess.run([train_summary_op],
+                            feed_dict={
+                                keep_prob:1.0,
+                                ts:  X_test,
+                                la:  y_test,
+                                seq_length: __sizes2[i_test]
+                            }
+                        )
+                    summary_writer_test.add_summary(test_summary, train_step)
+                at_epoch = cur_step//steps_per_epoch+1
+                if(ar and at_epoch==5): # output the ar history at epoch 5
+                    test_ar_history = sess.run([ar_history],
+                           feed_dict={
+                                keep_prob:1.0,
+                                ts:  X_test,
+                                la:  y_test,
+                                seq_length: __sizes2[i_test]
+                            }
+                        )
+                    #test_ar_history = []
+                    #for jj in range(nb_b+1):
+                        #index_start = jj*batch_size
+                        #index_end   = np.minimum(index_start+batch_size,len(X_test))
+                        # Actual training of the network
+                        #arhist_temp = sess.run(
+                            #[ar_history],
+                            #feed_dict={
+                                #keep_prob:1.0,
+                                #ts:  X_test[index_start:index_end,],
+                                #la:  y_test[index_start:index_end],
+                                #seq_length: __sizes2[i_test[index_start:index_end]]
+                            #}
+                        #)
+                        #test_ar_history.append(arhist_temp)
+                    with open(f_name+"_arhisotry{}.pickle".format(cv_step),"wb") as p:
+                        pickle.dump([test_ar_history],p)
+                        
+                risk_ = np.squeeze(np.array(risk_))
+                print("risk is of shape {}".format(risk_.shape))
+                whole_metrics = whole_metric(risk_, y_test, window_to_consider=window_to_consider)
+                to_print1 = "{} Test at epoches {}, AUC_TPR_FPR = {}, AUC_TPR_PPV = {}, under window={}".format(datetime.now().strftime("%Y-%m-%d %H:%M"), \
+                cur_step//steps_per_epoch+1, *whole_metrics)
+                whole_metrics_all.append(whole_metrics)
+                print(to_print1)
+                
+                scores = getScores2(risk_, pad_dir='right', window=window_to_consider)
+                fpr, tpr, _ = roc_curve(y_test, scores)
+                auc_fpr_tpr = auc(fpr, tpr)
+                auc_ppv_tpr = average_precision_score(y_test, scores)
+                aucs1.append(auc_fpr_tpr)
+                aucs2.append(auc_ppv_tpr)
+                with open(pickle_name, 'wb') as p:
+                    pickle.dump([aucs1, aucs2, whole_metrics_all, test_loss_all,test_acc_all], p)
+                to_print2 = "{} Test at epoches {}, auc1={}, auc2={}".format(datetime.now().strftime("%Y-%m-%d %H:%M"), cur_step//steps_per_epoch+1, auc_fpr_tpr, auc_ppv_tpr)
+                print(to_print2)
+                to_print3 = "test loss is {}, test accuracy is {}".format(test_loss, test_accu)
+                print(to_print3)
+                with open(f_name,"a") as f:
+                    f.write(to_print1+"\n")
+                    f.write(to_print2+"\n")
+                    f.write(to_print3+"\n")
+                    
+    
+    
+                # Reset for next epoch
+                step_in_epoch = 0
+    
+                # Shuffle training data
+                perm = np.arange(num_train)
+                np.random.shuffle(perm)
+                X_train = X_train[perm]
+                y_train = y_train[perm]
+                i_train = i_train[perm]
+                
+                print("#" * 100)
+    
+
