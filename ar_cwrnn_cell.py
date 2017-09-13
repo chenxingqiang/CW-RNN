@@ -1,5 +1,7 @@
 """
 This is a Clockwork RNN that can adaptively allocate model resources to different resolutions based on the input. Each hidden unit is "softly" assigned to each group with a leaky parameter. In order to be adaptive, it uses a two layer feed-forward network to determine the extent to which each neuron belongs to a group at each timestep. 
+Additional argument:
+    length_limit: the maximum length of the input timeseries
 """
 
 import tensorflow as tf
