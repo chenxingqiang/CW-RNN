@@ -14,9 +14,10 @@ class ClockworkRNNCell(tf.contrib.rnn.BasicRNNCell):
     '''
     '''
     Arguments for constructing a ClockworkRNNCell:
-        periods: the sorted list of periods of different modules, ex: [1,2,4,8,16]
+        periods: the sorted list of periods of different modules, ex: [1,2,4,8,16];
         group_size: the number of units in each module, ex:10, the number of 
-        hidden units is therefore len(periods) * group_size
+        hidden units is therefore len(periods) * group_size;
+        variant: the connectivity pattern of CW-RNN, 0 is the original one in paper, 1 is a simpler one, 2 is full connection
     '''
     
     def __init__(self, periods, group_size, variant=0, activation=tf.tanh, reuse=None):
@@ -56,7 +57,6 @@ class ClockworkRNNCell(tf.contrib.rnn.BasicRNNCell):
         
         active_index = self._compute_active_index()
         
-        print(inputs)
         with tf.variable_scope("input"):
             input_W = tf.get_variable("W", shape=[inputs.get_shape()[1], self._num_units], initializer=initializer_kernel)
 
