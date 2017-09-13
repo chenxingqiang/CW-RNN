@@ -72,11 +72,6 @@ class AR_CWRNNCell(tf.contrib.rnn.BasicRNNCell):
     
     def _compute_active_index(self, inputs, state):
         
-#        # decide activation group using pre-fixed periods
-#        predict_group = 1
-#        for i in range(len(self._periods)):
-#            # Check if (t MOD T_i == 0)
-#            predict_group = tf.where(tf.reduce_all(tf.equal(tf.mod(self._timestep, self._periods[i]),0)), i+1, predict_group)
         predict_group = tf.squeeze(tf.gather(self.keys, tf.gather(self._timestep,0)))
         # decide allocation of resources
         predict_groups = tf.tile(tf.reshape(predict_group,[1]), [self.batch_size]) #shape: batch_size,
