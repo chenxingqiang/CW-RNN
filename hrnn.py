@@ -1,8 +1,7 @@
 """
 Hierarchical RNN
 """
-exec(open("preprocess.py").read())
-exec(open("helper_function.py").read())
+from helper_function import *
 from keras.models import Model
 from keras.layers import Input, Dense, TimeDistributed, GRU, Bidirectional, Masking
 from rpy2.robjects.packages import importr
